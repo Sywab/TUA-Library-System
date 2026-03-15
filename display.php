@@ -5,7 +5,6 @@ require_once('../../config.php');
 
 global $DB, $PAGE, $OUTPUT, $USER, $CFG;
 
-// Moodle Page Setup
 $url = new moodle_url('/blocks/library_export/display.php');
 $PAGE->set_url($url);
 $PAGE->set_context(context_system::instance());
@@ -13,20 +12,14 @@ $PAGE->set_title('Display Log List');
 $PAGE->set_heading('Library Access Logs');
 require_login();
 
-// Capture parameters
 $mode = optional_param('mode', 'range', PARAM_ALPHANUM);
-$page = optional_param('page', 0, PARAM_INT);
-$perpage = 20;
-
-// NEW: Capture both categories AND specific courses
 $categoryids = optional_param_array('categoryids', [], PARAM_INT);
 $courseids = optional_param_array('courseids', [], PARAM_INT);
 
 $params = []; 
 $base_where_sql = ''; 
-$baseurl_params = ['mode' => $mode];
 
-// 1. Process Dates
+// 1. Process Dates (Only needed for the Course Checkbox UI)
 $raw_start = 0;
 $raw_end = 0;
 $raw_dates = '';
@@ -34,22 +27,15 @@ $raw_dates = '';
 if ($mode === 'range') {
     $raw_start = optional_param('start', 0, PARAM_INT);
     $raw_end = optional_param('end', 0, PARAM_INT);
-    
     if (empty($raw_start) || empty($raw_end)) {
         echo $OUTPUT->header();
         echo html_writer::tag('div', 'Error: Missing start or end date.', ['class' => 'alert alert-danger']);
         echo $OUTPUT->footer();
         die();
     }
-    
-    $baseurl_params['start'] = $raw_start;
-    $baseurl_params['end'] = $raw_end;
-
-    $enddate_adjusted = $raw_end + 86399;
     $base_where_sql = "(l.timecreated >= :start AND l.timecreated <= :end)";
     $params['start'] = $raw_start;
-    $params['end'] = $enddate_adjusted;
-
+    $params['end'] = $raw_end + 86399;
 } else if ($mode === 'multiple') {
     $raw_dates = optional_param('dates', '', PARAM_SEQUENCE); 
     if (empty($raw_dates)) {
@@ -58,17 +44,13 @@ if ($mode === 'range') {
         echo $OUTPUT->footer();
         die();
     }
-    
-    $baseurl_params['dates'] = $raw_dates;
     $date_array = explode(',', $raw_dates);
     $or_conditions = [];
-    
     foreach ($date_array as $index => $ts) {
         $start = (int)$ts;
-        $end = $start + 86399;
         $or_conditions[] = "(l.timecreated >= :start{$index} AND l.timecreated <= :end{$index})";
         $params["start{$index}"] = $start;
-        $params["end{$index}"] = $end;
+        $params["end{$index}"] = $start + 86399;
     }
     $base_where_sql = "(" . implode(' OR ', $or_conditions) . ")";
 } else {
@@ -96,70 +78,6 @@ if ($available_courses) {
     }
 }
 
-// 3. SMART FILTER LOGIC (Categories AND Courses)
-$final_where_sql = $base_where_sql;
-if (!empty($categoryids) || !empty($courseids)) {
-    $filter_conditions = [];
-    $filter_params = [];
-    
-    if (!empty($categoryids)) {
-        list($in_sql_cat, $in_params_cat) = $DB->get_in_or_equal($categoryids, SQL_PARAMS_NAMED, 'cat');
-        $filter_conditions[] = "c.category $in_sql_cat";
-        $filter_params = array_merge($filter_params, $in_params_cat);
-        foreach ($categoryids as $idx => $cid) {
-            $baseurl_params["categoryids[{$idx}]"] = $cid;
-        }
-    }
-    
-    if (!empty($courseids)) {
-        list($in_sql_crs, $in_params_crs) = $DB->get_in_or_equal($courseids, SQL_PARAMS_NAMED, 'crs');
-        $filter_conditions[] = "l.courseid $in_sql_crs";
-        $filter_params = array_merge($filter_params, $in_params_crs);
-        foreach ($courseids as $idx => $cid) {
-            $baseurl_params["courseids[{$idx}]"] = $cid;
-        }
-    }
-    
-    $final_where_sql .= " AND (" . implode(' OR ', $filter_conditions) . ")";
-    $params = array_merge($params, $filter_params);
-}
-
-$baseurl = new moodle_url('/blocks/library_export/display.php', $baseurl_params);
-
-// 4. Queries (Using final_where_sql)
-$summary_sql = "SELECT COALESCE(c.category, 0) AS catid, cc.name AS categoryname, COUNT(l.id) AS activity_count
-                FROM {logstore_standard_log} l
-                JOIN {user} u ON l.userid = u.id
-                LEFT JOIN {course} c ON l.courseid = c.id
-                LEFT JOIN {course_categories} cc ON cc.id = c.category
-                WHERE u.deleted = 0 AND $final_where_sql
-                GROUP BY COALESCE(c.category, 0), cc.name
-                ORDER BY cc.name ASC";
-$summary_records = $DB->get_records_sql($summary_sql, $params);
-
-$total_sql = "SELECT COUNT(l.id) 
-              FROM {logstore_standard_log} l 
-              JOIN {user} u ON l.userid = u.id 
-              LEFT JOIN {course} c ON l.courseid = c.id
-              WHERE u.deleted = 0 AND $final_where_sql";
-$totalcount = $DB->count_records_sql($total_sql, $params);
-
-$details_sql = "SELECT l.id AS logid, u.username, CONCAT(u.firstname, ' ', u.lastname) AS fullname, u.email, cc.name AS categoryname, c.fullname AS coursename, l.eventname, l.timecreated, l.ip,
-                       uc.cohortname
-                FROM {logstore_standard_log} l
-                JOIN {user} u ON l.userid = u.id
-                LEFT JOIN {course} c ON l.courseid = c.id
-                LEFT JOIN {course_categories} cc ON cc.id = c.category
-                LEFT JOIN (
-                    SELECT cm.userid, MAX(ch.name) AS cohortname
-                    FROM {cohort_members} cm
-                    JOIN {cohort} ch ON cm.cohortid = ch.id
-                    GROUP BY cm.userid
-                ) uc ON uc.userid = u.id
-                WHERE u.deleted = 0 AND $final_where_sql
-                ORDER BY cc.name ASC, l.timecreated DESC";
-$logs = $DB->get_records_sql($details_sql, $params, $page * $perpage, $perpage);
-
 // --- OUTPUT TO SCREEN ---
 echo $OUTPUT->header();
 echo '<div class="container mt-4">';
@@ -180,24 +98,18 @@ echo '<div class="row">';
 echo '<div class="col-md-8">';
 echo '<label class="font-weight-bold">Select Categories (Leave empty to show all):</label>';
 
-// 1. MAIN CATEGORY BOX
 echo '<div style="max-height: 150px; overflow-y: auto; border: 1px solid #ced4da; padding: 10px; border-radius: 5px; background: #fff;">';
 if (!empty($grouped_data)) {
     foreach ($grouped_data as $catid => $group) {
         $has_courses = count($group['courses']) > 0;
         $cat_explicitly_checked = in_array($catid, $categoryids);
-        
         $all_courses_checked = true;
         foreach ($group['courses'] as $c) {
-            if (!in_array($c->id, $courseids)) {
-                $all_courses_checked = false; break;
-            }
+            if (!in_array($c->id, $courseids)) { $all_courses_checked = false; break; }
         }
-        
         $cat_checked = ($cat_explicitly_checked || ($all_courses_checked && $has_courses && !empty($courseids))) ? 'checked' : '';
 
         echo '<div class="form-check">';
-        // NEW: Added name="categoryids[]" and value to send Category ID
         echo '<input class="form-check-input cat-cb" type="checkbox" name="categoryids[]" value="'.$catid.'" data-catid="'.$catid.'" id="cat_'.$catid.'" '.$cat_checked.'>';
         echo '<label class="form-check-label font-weight-bold" style="cursor:pointer;" for="cat_'.$catid.'">'.$group['name'].'</label>';
         echo '</div>';
@@ -207,12 +119,10 @@ if (!empty($grouped_data)) {
 }
 echo '</div>'; 
 
-// ADVANCED TOGGLE BUTTON
 echo '<div class="mt-2">';
 echo '<button type="button" class="btn btn-sm btn-outline-info font-weight-bold" id="btnAdvancedToggle">Advanced: Show Specific Courses <i class="fa fa-caret-down ml-1"></i></button>';
 echo '</div>';
 
-// 2. ADVANCED COURSES BOX (Hidden by default)
 echo '<div id="advancedBox" style="display:none; margin-top: 10px; max-height: 250px; overflow-y: auto; border: 1px solid #ced4da; padding: 15px; border-radius: 5px; background: #e9ecef;">';
 if (!empty($grouped_data)) {
     foreach ($grouped_data as $catid => $group) {
@@ -220,7 +130,6 @@ if (!empty($grouped_data)) {
         echo '<div class="mb-3">';
         echo '<div class="text-muted small font-weight-bold text-uppercase border-bottom border-secondary mb-2 pb-1">'.$group['name'].'</div>';
         foreach ($group['courses'] as $c) {
-            // UI memory trick: mark as checked if its parent category was explicitly checked
             $checked = (in_array($c->id, $courseids) || $cat_explicitly_checked) ? 'checked' : '';
             echo '<div class="form-check ml-3">';
             echo '<input class="form-check-input course-cb cat-child-'.$catid.'" type="checkbox" name="courseids[]" value="'.$c->id.'" id="course_'.$c->id.'" '.$checked.'>';
@@ -231,21 +140,99 @@ if (!empty($grouped_data)) {
     }
 }
 echo '</div>'; 
-
 echo '</div>'; // End col-md-8
 
 // Submit Buttons
 echo '<div class="col-md-4 d-flex flex-column justify-content-center">';
-echo '<button type="submit" class="btn btn-primary mb-2 w-100 font-weight-bold">Apply Filter</button>';
-echo '<button type="submit" formaction="ajax_export.php" class="btn btn-success w-100 font-weight-bold"><i class="fa fa-file-excel-o"></i> Export to Excel</button>';
-echo '</div>';
+echo '<button type="submit" id="btnApply" class="btn btn-primary mb-2 w-100 font-weight-bold" disabled>Apply Filter</button>';
 
+// --- FIX: Changed type to "button" so JS can securely construct the export URL ---
+echo '<button type="button" id="btnExport" class="btn btn-success w-100 font-weight-bold" disabled><i class="fa fa-file-excel-o"></i> Export to CSV</button>';
+
+echo '</div>';
 echo '</div></form></div></div>';
 
-// JavaScript for Smart Payload Management
-echo "<script>
+// --- LOADING BAR COMPONENT ---
+echo '<div id="loading-container" class="text-center my-5">';
+echo '<h5 class="text-muted mb-3"><i class="fa fa-spinner fa-spin mr-2"></i> Crunching the numbers... Please wait.</h5>';
+echo '<div class="progress" style="height: 25px; border-radius: 10px;">';
+echo '<div class="progress-bar progress-bar-striped progress-bar-animated bg-success" role="progressbar" style="width: 100%"></div>';
+echo '</div>';
+echo '</div>';
+
+// --- DATA CONTAINERS ---
+echo '<div id="data-container" style="display: none;">';
+
+// The wrapper for the Chart.js
+echo '<div id="chart-wrapper"></div>';
+
+echo '<h3 class="mb-3">Summary</h3>';
+echo '<table class="table table-bordered table-striped shadow-sm">';
+echo '<thead class="thead-light"><tr><th>Category Name</th><th>Total Activity Count</th></tr></thead>';
+echo '<tbody id="summary-tbody"></tbody></table>';
+echo '<hr class="my-5">';
+
+echo '<h3 class="mb-3">Detailed Logs <span id="total-records-badge" class="badge badge-info"></span></h3>';
+echo '<div id="pagination-top"></div>';
+echo '<div class="table-responsive">';
+echo '<table class="table table-bordered table-striped table-hover table-sm shadow-sm">';
+echo '<thead class="thead-light"><tr><th>Log ID</th><th>Username</th><th>Full Name</th><th>Role/Cohort</th><th>Course Name</th><th>Date</th><th>Time</th><th>IP Address</th></tr></thead>';
+echo '<tbody id="logs-tbody"></tbody></table></div>';
+echo '<div id="pagination-bottom"></div>';
+echo '</div>'; 
+
+echo '<div class="mt-4"><a href="' . $CFG->wwwroot . '/my" class="btn btn-secondary">← Back to Dashboard</a></div>';
+echo '</div>'; 
+echo $OUTPUT->footer();
+
+?>
+
+<script>
+    var moodleDefine = window.define;
+    window.define = undefined;
+</script>
+
+<script src="https://cdn.jsdelivr.net/npm/chart.js/dist/chart.umd.js"></script>
+
+<script>
+    window.define = moodleDefine;
+</script>
+
+<script>
 document.addEventListener('DOMContentLoaded', function() {
-    // 1. Toggle Advanced Box Visibility
+    const loadingContainer = document.getElementById('loading-container');
+    const dataContainer = document.getElementById('data-container');
+    const btnApply = document.getElementById('btnApply');
+    const btnExport = document.getElementById('btnExport');
+
+    // --- NEW: BULLETPROOF EXPORT LOGIC ---
+    // This guarantees the export button sends the EXACT checkboxes you selected
+    btnExport.addEventListener('click', function() {
+        let exportUrl = 'ajax_export.php?mode=' + encodeURIComponent(document.querySelector('input[name="mode"]').value);
+        
+        const startInput = document.querySelector('input[name="start"]');
+        if (startInput) {
+            exportUrl += '&start=' + startInput.value + '&end=' + document.querySelector('input[name="end"]').value;
+        } else {
+            exportUrl += '&dates=' + encodeURIComponent(document.querySelector('input[name="dates"]').value);
+        }
+        
+        // Grab every checked category
+        document.querySelectorAll('.cat-cb:checked').forEach(cb => {
+            exportUrl += '&categoryids[]=' + cb.value;
+        });
+        
+        // Grab every checked course
+        document.querySelectorAll('.course-cb:checked').forEach(cb => {
+            exportUrl += '&courseids[]=' + cb.value;
+        });
+        
+        // Fire the download
+        window.location.href = exportUrl;
+    });
+    // ------------------------------------
+
+    // Toggle Advanced Button
     const btnAdv = document.getElementById('btnAdvancedToggle');
     const advBox = document.getElementById('advancedBox');
     if(btnAdv && advBox) {
@@ -260,8 +247,10 @@ document.addEventListener('DOMContentLoaded', function() {
         });
     }
 
-    // 2. Sync Logic
+    // Category & Course Checkbox sync logic
     const catCbs = document.querySelectorAll('.cat-cb');
+    const courseCbs = document.querySelectorAll('.course-cb');
+    
     catCbs.forEach(function(catCb) {
         catCb.addEventListener('change', function() {
             const catId = this.getAttribute('data-catid');
@@ -269,7 +258,6 @@ document.addEventListener('DOMContentLoaded', function() {
         });
     });
 
-    const courseCbs = document.querySelectorAll('.course-cb');
     courseCbs.forEach(function(courseCb) {
         courseCb.addEventListener('change', function() {
             let catClass = Array.from(this.classList).find(c => c.startsWith('cat-child-'));
@@ -283,91 +271,147 @@ document.addEventListener('DOMContentLoaded', function() {
         });
     });
 
-    // 3. SMART PAYLOAD HANDLER
+    // SMART PAYLOAD logic for the "Apply Filter" button
     const filterForm = document.getElementById('filterForm');
     if (filterForm) {
         filterForm.addEventListener('submit', function() {
-            // Enable everything first
             courseCbs.forEach(cb => cb.disabled = false);
             catCbs.forEach(cb => cb.disabled = false);
-
             let allCatsChecked = true;
-            
             catCbs.forEach(function(catCb) {
                 if(catCb.checked) {
-                    // SMART PAYLOAD: If a category is checked, disable all its individual courses.
-                    // The server will only see the 1 Category ID instead of hundreds of Course IDs.
                     const catId = catCb.getAttribute('data-catid');
                     document.querySelectorAll('.cat-child-' + catId).forEach(cb => cb.disabled = true);
                 } else {
                     allCatsChecked = false;
                 }
             });
-
-            // If ALL categories are checked, disable EVERYTHING (acts as 'no filter' to save space)
             if (allCatsChecked && catCbs.length > 0) {
                 catCbs.forEach(cb => cb.disabled = true);
                 courseCbs.forEach(cb => cb.disabled = true);
             }
         });
     }
-});
-</script>";
 
-// --- SUMMARY TABLE ---
-echo '<h3 class="mb-3">Summary</h3>';
-echo '<table class="table table-bordered table-striped shadow-sm">';
-echo '<thead class="thead-light"><tr><th>Category Name</th><th>Total Activity Count</th></tr></thead>';
-echo '<tbody>';
-if ($summary_records) {
-    foreach ($summary_records as $record) {
-        $catname = $record->categoryname ?: 'System & Dashboard';
-        echo "<tr><td>{$catname}</td><td>{$record->activity_count}</td></tr>";
+    // Fetch the data from ajax_data_engine.php
+    function fetchLogData() {
+        btnApply.disabled = true;
+        btnExport.disabled = true;
+        loadingContainer.style.display = 'block';
+        dataContainer.style.display = 'none';
+
+        const currentParams = window.location.search;
+
+        fetch('ajax_data_engine.php' + currentParams)
+            .then(response => {
+                if (!response.ok) throw new Error("Network error");
+                return response.json();
+            })
+            .then(data => {
+                if(data.error) throw new Error(data.error);
+                
+                loadingContainer.style.display = 'none';
+                dataContainer.style.display = 'block';
+                
+                btnApply.disabled = false;
+                btnExport.disabled = false;
+
+                renderSummaryTable(data.summary);
+                renderLogsTable(data.logs, data.totalcount, data.pagination);
+                renderChart(data.chart);
+            })
+            .catch(error => {
+                console.error("Fetch error:", error);
+                loadingContainer.style.display = 'block'; 
+                dataContainer.style.display = 'none';
+                loadingContainer.innerHTML = '<div class="alert alert-danger mt-4"><i class="fa fa-exclamation-triangle mr-2"></i> An error occurred: ' + error.message + '</div>';
+                btnApply.disabled = false; 
+                btnExport.disabled = false;
+            });
     }
-} else {
-    echo '<tr><td colspan="2" class="text-center">No data found.</td></tr>';
-}
-echo '</tbody></table>';
 
-echo '<hr class="my-5">';
+    function renderSummaryTable(summaryData) {
+        const tbody = document.getElementById('summary-tbody');
+        if (!summaryData || summaryData.length === 0) {
+            tbody.innerHTML = '<tr><td colspan="2" class="text-center">No data found.</td></tr>';
+            return;
+        }
+        let rowsHtml = '';
+        summaryData.forEach(row => {
+            rowsHtml += `<tr><td>${row.name}</td><td>${row.count}</td></tr>`;
+        });
+        tbody.innerHTML = rowsHtml;
+    }
 
-// --- DETAILED LOGS TABLE ---
-echo '<h3 class="mb-3">Detailed Logs (' . $totalcount . ' total records)</h3>';
-echo $OUTPUT->paging_bar($totalcount, $page, $perpage, $baseurl);
+    function renderLogsTable(logsData, totalCount, paginationHtml) {
+        document.getElementById('total-records-badge').innerText = totalCount + ' total records';
+        document.getElementById('pagination-top').innerHTML = paginationHtml || '';
+        document.getElementById('pagination-bottom').innerHTML = paginationHtml || '';
 
-echo '<div class="table-responsive">';
-echo '<table class="table table-bordered table-striped table-hover table-sm shadow-sm">';
-echo '<thead class="thead-light"><tr><th>Log ID</th><th>Username</th><th>Full Name</th><th>Role/Cohort</th><th>Course Name</th><th>Date</th><th>Time</th><th>IP Address</th></tr></thead>';
-echo '<tbody>';
-
-if ($logs) {
-    foreach ($logs as $log) {
-        $date = date('Y-m-d', $log->timecreated);
-        $time = date('H:i:s', $log->timecreated);
-        $course = $log->coursename ?: 'N/A';
-        $cohort = $log->cohortname ?: 'None'; 
+        const tbody = document.getElementById('logs-tbody');
+        if (!logsData || logsData.length === 0) {
+            tbody.innerHTML = '<tr><td colspan="8" class="text-center">No detailed logs found.</td></tr>';
+            return;
+        }
         
-        echo "<tr>
-                <td>{$log->logid}</td>
-                <td>{$log->username}</td>
-                <td>{$log->fullname}</td>
-                <td>{$cohort}</td>
-                <td>{$course}</td>
-                <td>{$date}</td>
-                <td>{$time}</td>
-                <td>{$log->ip}</td>
-              </tr>";
+        let rowsHtml = '';
+        logsData.forEach(log => {
+            rowsHtml += `<tr>
+                <td>${log.logid}</td>
+                <td>${log.username}</td>
+                <td>${log.fullname}</td>
+                <td>${log.cohort}</td>
+                <td>${log.course}</td>
+                <td>${log.date}</td>
+                <td>${log.time}</td>
+                <td>${log.ip}</td>
+            </tr>`;
+        });
+        tbody.innerHTML = rowsHtml;
     }
-} else {
-    echo '<tr><td colspan="8" class="text-center">No detailed logs found.</td></tr>';
-}
 
-echo '</tbody></table></div>';
+    let activityChartInstance = null;
+    function renderChart(chartData) {
+        const wrapper = document.getElementById('chart-wrapper');
+        
+        if (activityChartInstance) {
+            activityChartInstance.destroy();
+            activityChartInstance = null;
+        }
 
-// Bottom Pagination Bar
-echo $OUTPUT->paging_bar($totalcount, $page, $perpage, $baseurl);
+        if (!chartData || !chartData.labels || chartData.labels.length === 0) {
+            wrapper.innerHTML = '<div class="alert alert-secondary text-center mt-4">No timeline data available for the selected filters.</div>';
+            return;
+        }
 
-// Back button and closing tags
-echo '<div class="mt-4"><a href="' . $CFG->wwwroot . '/my" class="btn btn-secondary">← Back to Dashboard</a></div>';
-echo '</div>'; // End container
-echo $OUTPUT->footer();
+        wrapper.innerHTML = `
+            <h3 class="mb-3">Activity Timeline</h3>
+            <div class="card shadow-sm mb-5">
+                <div class="card-body" style="height: 400px; position: relative;">
+                    <canvas id="activityChart"></canvas>
+                </div>
+            </div>`;
+
+        const ctx = document.getElementById('activityChart').getContext('2d');
+        activityChartInstance = new Chart(ctx, {
+            type: 'bar',
+            data: chartData,
+            options: {
+                responsive: true,
+                maintainAspectRatio: false,
+                scales: {
+                    x: { stacked: false, title: { display: true, text: 'Month' } },
+                    y: { stacked: false, beginAtZero: true, title: { display: true, text: 'Total Activity Count' } }
+                },
+                plugins: {
+                    tooltip: { mode: 'index', intersect: false },
+                    legend: { position: 'top' }
+                }
+            }
+        });
+    }
+
+    // Trigger the fetch immediately when the page loads
+    fetchLogData();
+});
+</script>

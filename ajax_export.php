@@ -1,171 +1,153 @@
 <?php
-// Path: D:\xampp\htdocs\moodle\blocks\library_export\ajax_export.php
+// Path: blocks/library_export/ajax_export.php
 
 require_once('../../config.php');
-require_once($CFG->libdir . '/excellib.class.php'); // Essential for Excel generation
-
-global $DB, $PAGE, $USER, $CFG;
-
-// Xray debug
-// $CFG->debug = E_ALL;
-// $CFG->debugdisplay = 1;
-
-// Moodle Page Setup
-$url = new moodle_url('/blocks/library_export/ajax_export.php');
-$PAGE->set_url($url);
-$PAGE->set_context(context_system::instance());
 require_login();
 
-try {
-    // Prevent corrupted files by clearing any unexpected output buffers
-    if (ob_get_level()) {
-        ob_end_clean();
+// Give PHP unlimited time and memory since we are streaming a massive CSV
+@set_time_limit(0);
+@ini_set('memory_limit', '-1');
+
+global $DB;
+
+// =========================================================================
+// 1. CAPTURE SMART FILTERS (Works perfectly with POST payloads)
+// =========================================================================
+$mode = optional_param('mode', 'range', PARAM_ALPHANUM);
+$categoryids = optional_param_array('categoryids', [], PARAM_INT);
+$courseids = optional_param_array('courseids', [], PARAM_INT);
+
+$params = []; 
+$base_where_sql = ''; 
+
+if ($mode === 'range') {
+    $raw_start = optional_param('start', 0, PARAM_INT);
+    $raw_end = optional_param('end', 0, PARAM_INT);
+    if (empty($raw_start) || empty($raw_end)) {
+        die('Missing start or end date.');
     }
-
-    $mode = optional_param('mode', 'range', PARAM_ALPHANUM);
-    
-    // FIXED: Removed the dashboard_viewed filter so courses actually load!
-    $params = []; 
-    $where_sql = '';
-
-    if ($mode === 'range') {
-        $startdate = optional_param('start', 0, PARAM_INT);
-        $enddate = optional_param('end', 0, PARAM_INT);
-        
-        if (empty($startdate) || empty($enddate)) {
-            die('<h2>Error: Missing start or end date from the block.</h2>');
-        }
-        
-        $enddate = $enddate + 86399; 
-        $where_sql = "(l.timecreated >= :start AND l.timecreated <= :end)";
-        $params['start'] = $startdate;
-        $params['end'] = $enddate;
-
-    } else if ($mode === 'multiple') {
-        $dates = optional_param('dates', '', PARAM_SEQUENCE); 
-        if (empty($dates)) {
-            die('<h2>Error: Dates were not sent to the database.</h2>');
-        }
-
-        $date_array = explode(',', $dates);
-        $or_conditions = [];
-        
-        foreach ($date_array as $index => $ts) {
-            $start = (int)$ts;
-            $end = $start + 86399;
-            $or_conditions[] = "(l.timecreated >= :start{$index} AND l.timecreated <= :end{$index})";
-            $params["start{$index}"] = $start;
-            $params["end{$index}"] = $end;
-        }
-        
-        $where_sql = "(" . implode(' OR ', $or_conditions) . ")";
-    } else {
-        die('<h2>Error: Invalid mode</h2>');
+    $base_where_sql = "(l.timecreated >= :start AND l.timecreated <= :end)";
+    $params['start'] = $raw_start;
+    $params['end'] = $raw_end + 86399;
+} else if ($mode === 'multiple') {
+    $raw_dates = optional_param('dates', '', PARAM_SEQUENCE); 
+    if (empty($raw_dates)) {
+        die('Dates were not sent.');
     }
-
-    // Initialize Workbook
-    $filename = "Library_Access_Logs_" . date('Ymd') . ".xlsx";
-    $workbook = new MoodleExcelWorkbook($filename);
-    
-    // Create Header Style
-    $format_header = $workbook->add_format();
-    $format_header->set_bold();
-    $format_header->set_bg_color('silver');
-    $format_header->set_border(1);
-
-    // Fetch Detailed Data
-    $sql = "SELECT l.id AS logid, 
-                   u.username,
-                   CONCAT(u.firstname, ' ', u.lastname) AS fullname, 
-                   u.email,
-                   cc.name AS categoryname,
-                   c.fullname AS coursename, 
-                   l.eventname,
-                   l.timecreated,
-                   l.ip,
-                   uc.cohortname
-            FROM {logstore_standard_log} l
-            JOIN {user} u ON l.userid = u.id
-            LEFT JOIN {course} c ON l.courseid = c.id
-            LEFT JOIN {course_categories} cc ON cc.id = c.category
-            LEFT JOIN (
-                SELECT cm.userid, MAX(ch.name) AS cohortname
-                FROM {cohort_members} cm
-                JOIN {cohort} ch ON cm.cohortid = ch.id
-                GROUP BY cm.userid
-            ) uc ON uc.userid = u.id
-            WHERE u.deleted = 0 
-            AND $where_sql
-            ORDER BY cc.name ASC, l.timecreated DESC";
-    
-    $logs = $DB->get_records_sql($sql, $params);
-
-    // Grouping Data & Counting
-    $data_by_college = [];
-    $college_counts = [];
-    
-    if ($logs) {
-        foreach ($logs as $log) {
-            $college = $log->categoryname ?: 'System & Dashboard';
-            $data_by_college[$college][] = $log;
-            $college_counts[$college] = ($college_counts[$college] ?? 0) + 1;
-        }
-    } else {
-        $sheet = $workbook->add_worksheet('No Data');
-        $sheet->write(0, 0, 'No logs found for the selected dates.', $format_header);
-        $workbook->close();
-        exit;
+    $date_array = array_map('intval', explode(',', $raw_dates));
+    $or_conditions = [];
+    foreach ($date_array as $index => $start) {
+        $or_conditions[] = "(l.timecreated >= :start{$index} AND l.timecreated <= :end{$index})";
+        $params["start{$index}"] = $start;
+        $params["end{$index}"] = $start + 86399;
     }
-
-    // Create SUMMARY SHEET
-    $summary = $workbook->add_worksheet('Summary');
-    $summary->write(0, 0, 'Category Name', $format_header);
-    $summary->write(0, 1, 'Total Activity Count', $format_header);
-    
-    $s_row = 1;
-    foreach ($college_counts as $name => $count) {
-        $summary->write($s_row, 0, $name);
-        $summary->write($s_row, 1, $count);
-        $s_row++;
-    }
-
-   // Create INDIVIDUAL COLLEGE SHEETS
-    foreach ($data_by_college as $college_name => $entries) {
-        $tab_name = substr($college_name, 0, 31);
-        $sheet = $workbook->add_worksheet($tab_name);
-        
-        // Added 'Role/Cohort' to the array
-        $headers = array('Log ID', 'Username', 'Full Name', 'Email', 'Role/Cohort', 'Course Name', 'Action', 'Date', 'Time', 'IP Address');
-        foreach ($headers as $col_idx => $title) {
-            $sheet->write(0, $col_idx, $title, $format_header);
-        }
-
-        $row_idx = 1;
-        foreach ($entries as $entry) {
-            $sheet->write($row_idx, 0, $entry->logid);
-            $sheet->write($row_idx, 1, $entry->username);
-            $sheet->write($row_idx, 2, $entry->fullname);
-            $sheet->write($row_idx, 3, $entry->email);
-            
-            // Insert cohortname at index 4, and shift all subsequent indexes down by 1
-            $sheet->write($row_idx, 4, $entry->cohortname ?: 'None');
-            $sheet->write($row_idx, 5, $entry->coursename ?: 'N/A');
-            $sheet->write($row_idx, 6, str_replace('\\', ' ', $entry->eventname));
-            $sheet->write($row_idx, 7, date('Y-m-d', $entry->timecreated));
-            $sheet->write($row_idx, 8, date('H:i:s', $entry->timecreated));
-            $sheet->write($row_idx, 9, $entry->ip);
-            $row_idx++;
-        }
-    }
-
-    // Close and Send to Browser automatically
-    $workbook->close();
-    exit;
-
-} catch (Exception $e) {
-    echo "<div style='font-family: sans-serif; padding: 20px;'>";
-    echo "<h2 style='color: red;'>Database Error Encountered</h2>";
-    echo "<strong>Error Message:</strong> <p>" . $e->getMessage() . "</p>";
-    echo "</div>";
-    die();
+    $base_where_sql = "(" . implode(' OR ', $or_conditions) . ")";
 }
+
+$final_where_sql = $base_where_sql;
+if (!empty($categoryids) || !empty($courseids)) {
+    $filter_conditions = [];
+    if (!empty($categoryids)) {
+        list($in_sql_cat, $in_params_cat) = $DB->get_in_or_equal($categoryids, SQL_PARAMS_NAMED, 'cat');
+        $filter_conditions[] = "c.category $in_sql_cat";
+        $params = array_merge($params, $in_params_cat);
+    }
+    if (!empty($courseids)) {
+        list($in_sql_crs, $in_params_crs) = $DB->get_in_or_equal($courseids, SQL_PARAMS_NAMED, 'crs');
+        $filter_conditions[] = "l.courseid $in_sql_crs";
+        $params = array_merge($params, $in_params_crs);
+    }
+    $final_where_sql .= " AND (" . implode(' OR ', $filter_conditions) . ")";
+}
+
+// =========================================================================
+// 2. SET UP DIRECT BROWSER CSV DOWNLOAD
+// =========================================================================
+// Clear out any stray spaces or HTML that might break the file
+if (ob_get_length()) { ob_clean(); }
+
+$filename = "Library_Access_Logs_" . date('Ymd_Hi') . ".csv";
+
+// Tell the browser a CSV file is coming instantly
+header('Content-Type: text/csv; charset=utf-8');
+header('Content-Disposition: attachment; filename="' . $filename . '"');
+header('Pragma: no-cache');
+header('Expires: 0');
+
+// Open a direct pipe to the browser's download manager
+$output = fopen('php://output', 'w');
+
+// Add a UTF-8 BOM marker so Microsoft Excel formats the text correctly
+fputs($output, $bom = (chr(0xEF) . chr(0xBB) . chr(0xBF)));
+
+// Write the Column Headers (All data in a single sheet)
+fputcsv($output, ['Log ID', 'Username', 'Full Name', 'Email', 'College/Category', 'Role/Cohort', 'Course Name', 'Action', 'Date', 'Time', 'IP Address']);
+
+// =========================================================================
+// 3. PRE-FETCH COHORTS IN PHP (Prevents MySQL Database Lockups)
+// =========================================================================
+$cohort_sql = "SELECT cm.userid, ch.name AS cohortname
+               FROM {cohort_members} cm
+               JOIN {cohort} ch ON cm.cohortid = ch.id";
+$cohort_rs = $DB->get_recordset_sql($cohort_sql);
+$user_cohorts = [];
+if ($cohort_rs->valid()) {
+    foreach ($cohort_rs as $rec) {
+        if (!isset($user_cohorts[$rec->userid]) || $rec->cohortname > $user_cohorts[$rec->userid]) {
+            $user_cohorts[$rec->userid] = $rec->cohortname;
+        }
+    }
+}
+$cohort_rs->close();
+
+// =========================================================================
+// 4. STREAM DATA ROW BY ROW
+// =========================================================================
+$sql = "SELECT l.id AS logid,
+               u.id AS userid,
+               u.username,
+               CONCAT(u.firstname, ' ', u.lastname) AS fullname,
+               u.email,
+               cc.name AS categoryname,
+               c.fullname AS coursename,
+               l.timecreated,
+               l.ip,
+               l.eventname
+        FROM {logstore_standard_log} l
+        JOIN {user} u ON l.userid = u.id
+        LEFT JOIN {course} c ON l.courseid = c.id
+        LEFT JOIN {course_categories} cc ON cc.id = c.category
+        WHERE u.deleted = 0 AND $final_where_sql
+        ORDER BY l.timecreated DESC";
+
+// get_recordset_sql acts like a conveyor belt, drastically reducing memory usage!
+$rs = $DB->get_recordset_sql($sql, $params);
+
+if ($rs->valid()) {
+    foreach ($rs as $entry) {
+        // Look up cohort instantly from our PHP dictionary
+        $cohort = isset($user_cohorts[$entry->userid]) ? $user_cohorts[$entry->userid] : 'None';
+        
+        $row = [
+            $entry->logid,
+            $entry->username,
+            $entry->fullname,
+            $entry->email,
+            $entry->categoryname ?: 'System Dashboard', // Differentiates the college directly in the column!
+            $cohort,
+            $entry->coursename ?: 'N/A',
+            str_replace('\\', ' ', $entry->eventname),
+            date('Y-m-d', $entry->timecreated),
+            date('H:i:s', $entry->timecreated),
+            $entry->ip
+        ];
+        
+        // Push this row instantly to the downloaded file
+        fputcsv($output, $row);
+    }
+}
+
+// Clean up and close connection
+$rs->close();
+fclose($output);
+exit;
